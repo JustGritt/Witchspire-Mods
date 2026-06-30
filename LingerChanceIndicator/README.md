@@ -13,8 +13,13 @@ that defeating the monster spawns a capturable spirit at all. (It's labelled "Ca
 because the follow-up bond roll is ~100%, so linger chance ≈ your real capture odds.)
 
 By default the label shows only that total. **Press `L` in-game** (the `ToggleDetailsKey`) to
-reveal the full calculation behind it — and press it again to hide it. It reads as the actual
-equation, e.g.:
+cycle through three display modes — each press steps **compact → full breakdown → off → compact**:
+
+1. **Compact** — just `Capture X.X%`.
+2. **Full breakdown** — the headline plus the actual equation behind it (see below).
+3. **Off** — the label is hidden entirely.
+
+In the full-breakdown mode it reads as the actual equation, e.g.:
 
 ```
 Capture 7.9%  =  2.0% x 3.00 x 1.31
@@ -75,8 +80,8 @@ Tunables live in the `LingerChanceConfig` namespace at the top of the `.as` file
 | `VerticalOffset` | `-10` | Offset from the nameplate, in cm (negative = below the healthbar) |
 | `ScreenSizeFactor` | `0.022` | Label scales with distance to keep a constant on-screen size |
 | `MinTextSize` / `MaxTextSize` | `10` / `90` | Clamp on the distance-scaled size (keep Max high so far text stays readable) |
-| `ToggleDetailsKey` | `EKeys::L` | Key that toggles the calculation equation on/off in-game (doesn't consume input, so it co-exists with the game's binds) |
-| `bStartWithDetailsVisible` | `false` | Whether the equation starts visible on load |
+| `ToggleDetailsKey` | `EKeys::L` | Key that cycles the display mode (compact → full breakdown → off) in-game (doesn't consume input, so it co-exists with the game's binds) |
+| `StartMode` | `ELingerDisplayMode::Capture` | Display mode on load: `Capture` (compact), `Breakdown` (equation shown), or `None` (hidden) |
 
 ## Notes & limitations
 

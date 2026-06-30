@@ -7,24 +7,40 @@
 //    2. bond   (BondingSpirit::OnInteract):   bondChance x bondGear
 //  each clamped 0..1. Bond is usually 100% (BondingChance defaults to 1.0) but
 //  some species/gear move it, so we read and fold it in rather than assume. Press
-//  ToggleDetailsKey to show the full equation. Renders via UTextRenderComponent
-//  (works in the game's Shipping build; no UMG asset needed).
+//  ToggleDetailsKey to cycle the readout through three modes: compact "Capture X%",
+//  the full equation, then hidden. Renders via UTextRenderComponent (works in the
+//  game's Shipping build; no UMG asset needed).
 //
 //  Performance: the label runs on every client frame, so the hot path is kept lean.
 //  The expensive bit is UTextRenderComponent::SetText, which re-tessellates the glyph
-//  mesh - so we (a) recompute the odds + re-scan the look-at target at a fixed 20 Hz
-//  rather than every frame, (b) reposition the (cheap) actor transform every frame so
-//  tracking stays smooth, and (c) only call SetText/WorldSize when the text, size, or
-//  colour actually changed (a small deadband on size absorbs distance jitter).
+//  mesh, so the work is split by how often it actually has to change:
+//    - Every frame: only the actor transform moves (location + yaw billboard toward
+//      the camera). That rebuilds no geometry, so tracking stays smooth at any FPS.
+//    - At a fixed 20 Hz: re-scan the look-at target and re-apply the glyph content
+//      (size/text/colour). Pinning this to the recompute rate stops re-tessellation
+//      from scaling with frame rate; SetText/WorldSize still only fire when the size
+//      (past a deadband), text, or colour actually changed.
+//    - Per look-at target: the odds + label string are built once and cached, so the
+//      attribute reads and string formatting are skipped while you keep looking at the
+//      same familiar (a ~1 s refresh still catches a mid-look gear/pity change).
 // =============================================================================
+
+// How the readout is displayed; the toggle key steps through these in order.
+enum ELingerDisplayMode
+{
+    Capture,     // headline only: "Capture X%"
+    Breakdown,   // headline + the full equation
+    None,        // label fully hidden
+}
 
 namespace LingerChanceConfig
 {
-    // >>> Hotkey: change this to rebind the breakdown toggle. Any EKeys::... value
+    // >>> Hotkey: change this to rebind the display cycle. Any EKeys::... value
     //     (e.g. EKeys::K, EKeys::J, EKeys::B). BindKey doesn't consume input, so
-    //     it co-exists with the game's own bindings.
+    //     it co-exists with the game's own bindings. Each press advances
+    //     Capture -> Breakdown -> None -> Capture.
     const FKey ToggleDetailsKey = EKeys::L;
-    const bool bStartWithDetailsVisible = false;   // breakdown shown on load?
+    const ELingerDisplayMode StartMode = ELingerDisplayMode::Capture;   // mode on load
 
     // Label placement/size. VerticalOffset: cm from the nameplate (negative =
     // below the healthbar). The label scales with distance for a constant
@@ -34,11 +50,16 @@ namespace LingerChanceConfig
     const float MinTextSize = 10.0;
     const float MaxTextSize = 90.0;
 
-    // How often the odds + look-at target are recomputed (seconds). Positioning still
-    // runs every frame; only the raycast/attribute reads/string build are throttled.
+    // How often the look-at target is re-scanned and the glyph content re-applied
+    // (seconds). The actor transform still tracks every frame; the raycast, attribute
+    // reads, string build and glyph rebuild are all throttled to this rate.
     const float RecomputeInterval = 0.05;   // 20 Hz
     // Deadband (cm) below which a WorldSize change won't trigger a glyph rebuild.
     const float WorldSizeDeadband = 0.25;
+    // While the same familiar stays targeted its odds are cached and the label string
+    // reused; force a fresh re-read every this-many recompute ticks (so this x
+    // RecomputeInterval seconds) to catch a mid-look gear/pity change.
+    const int OddsRefreshTicks = 20;   // ~1 s at the default 20 Hz
 }
 
 // The floating label: one reused instance the subsystem repositions, re-aims at
@@ -69,21 +90,26 @@ class ALingerChanceLabel : AActor
     private FColor CachedColor = FColor::White;
     private float CachedWorldSize = -1.0;
 
-    void UpdateLabel(const FVector& Location, const FRotator& Rotation, float WorldSize, const FString& Text, const FColor& Color)
+    // Per-frame: just move the actor (location + yaw billboard). A transform change
+    // rebuilds no glyph geometry, so this stays cheap enough to run every frame and
+    // keeps tracking smooth regardless of frame rate.
+    void MoveTo(const FVector& Location, const FRotator& Rotation)
     {
         if (!bShown)
         {
             SetActorHiddenInGame(false);
             bShown = true;
         }
-
-        // Position/rotation are just a transform move - cheap, so always track.
         SetActorLocation(Location);
         SetActorRotation(Rotation);
+    }
 
-        // The glyph mesh only needs rebuilding when the text, size, or colour change.
-        // A WorldSize field change only takes visual effect via a SetText rebuild, so
-        // both are driven together below.
+    // At the recompute cadence: refresh the glyph mesh, but only the parts that
+    // actually changed. The WorldSize/SetText path re-tessellates, so it's gated
+    // behind a size deadband plus a text/colour change test. A WorldSize field change
+    // only takes visual effect via a SetText rebuild, so the two are driven together.
+    void ApplyContent(float WorldSize, const FString& Text, const FColor& Color)
+    {
         const bool bSizeChanged = Math::Abs(WorldSize - CachedWorldSize) > LingerChanceConfig::WorldSizeDeadband;
         const bool bTextChanged = Text.Compare(CachedText) != 0;
         const bool bColorChanged = Color.R != CachedColor.R || Color.G != CachedColor.G || Color.B != CachedColor.B;
@@ -134,7 +160,7 @@ class ALingerChanceInput : AActor
     UPROPERTY(DefaultComponent)
     UInputComponent InputComp;
 
-    bool bDetailsVisible = LingerChanceConfig::bStartWithDetailsVisible;
+    ELingerDisplayMode DisplayMode = LingerChanceConfig::StartMode;
 
     UFUNCTION(BlueprintOverride)
     void BeginPlay()
@@ -146,10 +172,16 @@ class ALingerChanceInput : AActor
         InputComp.BindKey(LingerChanceConfig::ToggleDetailsKey, EInputEvent::IE_Pressed, FInputActionHandlerDynamicSignature(this, n"OnTogglePressed"));
     }
 
+    // One step around the Capture -> Breakdown -> None -> Capture cycle.
     UFUNCTION()
     private void OnTogglePressed(FKey Key)
     {
-        bDetailsVisible = !bDetailsVisible;
+        switch (DisplayMode)
+        {
+            case ELingerDisplayMode::Capture:   DisplayMode = ELingerDisplayMode::Breakdown; break;
+            case ELingerDisplayMode::Breakdown: DisplayMode = ELingerDisplayMode::None;       break;
+            default:                            DisplayMode = ELingerDisplayMode::Capture;    break;
+        }
     }
 }
 
@@ -163,6 +195,12 @@ class ULingerChanceSubsystem : UScriptWorldSubsystem
     // Throttle state for the expensive recompute (raycast + attribute reads + strings).
     private float RecomputeTimer = 1.0;   // high so the first tick recomputes immediately
     private bool bLastDetailsVisible = false;
+
+    // Per-target odds cache: while the same familiar + detail mode persist we reuse the
+    // built string instead of re-reading attributes every tick. The countdown bounds
+    // how many recomputes we trust the cache for before forcing a fresh read.
+    private bool bLastBuiltDetails = false;
+    private int OddsRefreshCountdown = 0;
 
     // Last recompute result, reused by the per-frame positioning pass.
     private ANPCBase CachedFamiliar;
@@ -183,26 +221,43 @@ class ULingerChanceSubsystem : UScriptWorldSubsystem
     UFUNCTION(BlueprintOverride)
     void Tick(float DeltaTime)
     {
-        APlayerCharacter Player = Game::GetLocalPlayer();
         APlayerController Controller = Game::GetLocalPlayerController();
-        if (Player == nullptr || Controller == nullptr)
+        if (Controller == nullptr)
         {
             HideLabel();
-            bHasTarget = false;
+            ClearTarget();
             return;
         }
 
         EnsureInput();   // spawn the key receiver once the controller exists
         EnsureLabel();
 
-        // --- Throttled: re-scan the look-at target and recompute the odds/text ---
+        // "None" hides the readout entirely but keeps the input actor alive so the
+        // next key press brings it back.
+        const ELingerDisplayMode Mode = (Input != nullptr) ? Input.DisplayMode : LingerChanceConfig::StartMode;
+        if (Mode == ELingerDisplayMode::None)
+        {
+            HideLabel();
+            ClearTarget();
+            return;
+        }
+
+        // --- Throttled: re-scan the look-at target and refresh the odds/text/size ---
         RecomputeTimer += DeltaTime;
-        const bool bDetails = (Input != nullptr && Input.bDetailsVisible);
+        const bool bDetails = (Mode == ELingerDisplayMode::Breakdown);
+        bool bRecomputed = false;
         if (RecomputeTimer >= LingerChanceConfig::RecomputeInterval || bDetails != bLastDetailsVisible)
         {
             RecomputeTimer = 0.0;
             bLastDetailsVisible = bDetails;
-            RecomputeTarget(Player, bDetails);
+            // The player is only needed by the recompute, so fetch it here rather than
+            // on every frame.
+            APlayerCharacter Player = Game::GetLocalPlayer();
+            if (Player != nullptr)
+                RecomputeTarget(Player, bDetails);
+            else
+                ClearTarget();
+            bRecomputed = true;
         }
 
         if (!bHasTarget || CachedFamiliar == nullptr || !IsValid(CachedFamiliar))
@@ -211,7 +266,7 @@ class ULingerChanceSubsystem : UScriptWorldSubsystem
             return;
         }
 
-        // --- Every frame: anchor to the nameplate, billboard, distance-scaled size ---
+        // --- Every frame: anchor to the nameplate and yaw-billboard toward the camera.
         FVector Anchor;
         if (CachedNameplate != nullptr)
         {
@@ -227,35 +282,49 @@ class ULingerChanceSubsystem : UScriptWorldSubsystem
         }
         const FVector LabelLocation = Anchor + FVector::UpVector * LingerChanceConfig::VerticalOffset;
 
-        // Yaw-only billboard, sized to keep a roughly constant on-screen size.
         const FVector CameraLocation = Controller.PlayerCameraManager.GetCameraLocation();
         const FVector ToCamera = CameraLocation - LabelLocation;
-        const float WorldSize = Math::Clamp(ToCamera.Size() * LingerChanceConfig::ScreenSizeFactor, LingerChanceConfig::MinTextSize, LingerChanceConfig::MaxTextSize);
         FRotator FaceRotation = ToCamera.Rotation();
         FaceRotation.Pitch = 0;
         FaceRotation.Roll = 0;
 
-        if (Label != nullptr)
-            Label.UpdateLabel(LabelLocation, FaceRotation, WorldSize, CachedText, CachedColor);
+        if (Label == nullptr)
+            return;
+
+        // Transform tracks every frame (cheap, no geometry rebuild); the glyph content
+        // (size/text/colour) is only re-applied on recompute ticks, so re-tessellation
+        // can't outpace the recompute rate even on a high-refresh display.
+        Label.MoveTo(LabelLocation, FaceRotation);
+        if (bRecomputed)
+        {
+            const float WorldSize = Math::Clamp(ToCamera.Size() * LingerChanceConfig::ScreenSizeFactor, LingerChanceConfig::MinTextSize, LingerChanceConfig::MaxTextSize);
+            Label.ApplyContent(WorldSize, CachedText, CachedColor);
+        }
     }
 
     // Resolves the current look-at familiar and computes its capture odds + label
     // text/colour. Clears bHasTarget when there's nothing capturable to show.
     private void RecomputeTarget(APlayerCharacter Player, bool bDetails)
     {
-        bHasTarget = false;
-        CachedNameplate = nullptr;
-
         if (Player.AimingComp == nullptr)
+        {
+            ClearTarget();
             return;
+        }
 
         const FAimingResult LookAt = Player.AimingComp.CalculateLookAtResult();
         if (!LookAt.HasTarget() || LookAt.Target == nullptr)
+        {
+            ClearTarget();
             return;
+        }
 
         ANPCBase Familiar = Cast<ANPCBase>(LookAt.Target.Owner);
         if (Familiar == nullptr || Familiar.AbilityComp == nullptr || Familiar.FamiliarComp == nullptr)
+        {
+            ClearTarget();
             return;
+        }
 
         // Filter out anything that can't actually be captured:
         //  - owned familiars can't be re-captured.
@@ -266,7 +335,23 @@ class ULingerChanceSubsystem : UScriptWorldSubsystem
         //    there's no item, so non-capturables (e.g. Al'uunian Vanguard) would slip
         //    through an Element.IsValid() check.
         if (Familiar.HasPlayerOwner() || !Familiar.FamiliarComp.ItemTag.IsValid())
+        {
+            ClearTarget();
             return;
+        }
+
+        // Steady state: same familiar, same detail mode, cache not yet expired -> the
+        // odds and label string are unchanged, so reuse them and skip the attribute
+        // reads and string formatting entirely. The countdown forces a periodic fresh
+        // read so a mid-look gear/pity change still surfaces.
+        if (Familiar == CachedFamiliar && bDetails == bLastBuiltDetails && OddsRefreshCountdown > 0)
+        {
+            OddsRefreshCountdown -= 1;
+            bHasTarget = true;
+            return;
+        }
+        OddsRefreshCountdown = LingerChanceConfig::OddsRefreshTicks;
+        bLastBuiltDetails = bDetails;
 
         const FGameplayTag Element = Familiar.FamiliarComp.GetElementalType();
 
@@ -357,5 +442,14 @@ class ULingerChanceSubsystem : UScriptWorldSubsystem
     {
         if (Label != nullptr && IsValid(Label))
             Label.HideLabel();
+    }
+
+    // Drop the current target and its odds cache so the next acquisition rebuilds fresh.
+    private void ClearTarget()
+    {
+        bHasTarget = false;
+        CachedFamiliar = nullptr;
+        CachedNameplate = nullptr;
+        OddsRefreshCountdown = 0;
     }
 }
