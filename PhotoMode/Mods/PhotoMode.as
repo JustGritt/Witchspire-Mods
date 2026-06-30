@@ -25,7 +25,13 @@
 //    * Apply a screen color FILTER like a camera app — saturation, grayscale,
 //      contrast and a warm / cool tint, with one-tap presets (Vivid, B&W,
 //      Noir, Sepia, Warm, Cool).
-//    * Hide the HUD.
+//    * Blur the BACKGROUND (depth of field): keep your subject sharp and blur
+//      everything off the focal plane, with auto-focus on the screen center.
+//    * POSE the player: drop into one of the game's own idle / combat (wand /
+//      sword / unarmed) / broom-mount stances, or hard-freeze the player's
+//      frame to capture any in-game action (a mid-swing attack, a cast).
+//    * Hide the HUD — including the aiming crosshair and the familiar / monster
+//      nameplates (name, level, stars + health bar), both separate widgets.
 //
 //  Everything is driven through the game's OWN systems, the same ones the native
 //  "Settings -> World" debug window uses:
@@ -37,7 +43,11 @@
 //      clock on AHercGameState (SetWorldTimeStamp)
 //    - ACloudVolume::SetActorHiddenInGame()                    (clouds)
 //    - UPostProcessComponent + FPostProcessSettings color grading (filter)
-//    - AHercHUD::SetVisibility()                               (HUD)
+//    - UPostProcessComponent + FPostProcessSettings cine DoF    (background blur)
+//    - AHercCharacter.PlaySlotAnimation() from UPlayerAnimSet,
+//      plus per-player CustomTimeDilation = 0                   (player pose)
+//    - AHercHUD::SetVisibility() + CVars Herc.UI.HideCursor
+//      + Herc.UI.HideNameplates                  (HUD + crosshair + nameplates)
 //
 //  NOTE: Witchspire has no rain / storm / weather state machine exposed to
 //  scripts. The sky is a UE5 Day Sequence + Sky System, so "weather" here means
@@ -49,10 +59,11 @@
 //  this mod able to open the menu on its OWN, flip bBindOwnMenuKey below — but
 //  ONLY if no other mod already binds the same key, or they'll cancel out.
 //
-//  Freezing entities / time of day are server-authoritative, so they run on the
-//  host (single-player or listen-server) — the host owns the authoritative
-//  characters, so freezing them there replicates the held pose to any clients.
-//  Hiding the HUD / clouds and the color filter are local-only (visual).
+//  Freezing entities / time of day / player pose are server-authoritative, so
+//  they run on the host (single-player or listen-server) — the host owns the
+//  authoritative characters, so freezing/posing them there replicates to any
+//  clients. Hiding the HUD / clouds, the color filter and the background blur
+//  are local-only (visual).
 // =============================================================================
 
 
@@ -97,6 +108,26 @@ namespace PhotoModeConfig
     const FKey FlyDownKey    = EKeys::Q;
     const FKey FlyBoostKey   = EKeys::LeftShift;
     const FKey FlySlowKey    = EKeys::LeftControl;
+
+    // --- Background blur (depth of field) -----------------------------------
+    // How far (cm) the auto-focus trace reaches out from the camera looking for
+    // a subject to focus on, and the manual / fallback focus distance used when
+    // auto-focus is off or the trace hits nothing.
+    const float BlurFocusTraceDistance = 100000.0;
+    const float DefaultBlurFocalDistance = 1500.0;
+
+    // Background blur strength maps to a camera f-stop: strength 0 -> MaxFStop
+    // (almost no blur), strength 1 -> MinFStop (strong blur). A wide sensor
+    // makes the blur pronounced enough to read on screen.
+    const float BlurMaxFStop = 8.0;
+    const float BlurMinFStop = 1.2;
+    const float BlurSensorWidth = 36.0;   // mm; full-frame, for a visible effect
+
+    // --- Player pose --------------------------------------------------------
+    // How often (s) to re-assert a held stance, but only if it has actually
+    // blended out (we check IsSlotActive first, so a still-playing pose is never
+    // restarted). Keeps a stance held without visibly popping.
+    const float PoseReassertInterval = 0.4;
 }
 
 
@@ -267,6 +298,70 @@ class UPhotoModeStore : UScriptGameInstanceSubsystem
     float FilterSaturation = 1.0;   // 0 = grayscale, 1 = normal, >1 = vivid
     float FilterContrast = 1.0;     // 1 = normal
     float FilterTemperature = 0.0;  // -1 = cool (blue), 0 = neutral, +1 = warm (orange)
+
+    // --- Background blur (depth of field). Shares the filter's post-process
+    //     component; off by default so the game's own DoF is untouched. --------
+    bool bBlurEnabled = false;
+    bool bBlurAutoFocus = true;     // focus distance from a camera-forward trace
+    float BlurFocalDistance = PhotoModeConfig::DefaultBlurFocalDistance;  // cm (manual / fallback)
+    float BlurStrength = 0.6;       // 0..1; higher = blurrier (lower f-stop)
+
+    // --- Player pose. PoseIndex 0 = none; 1.. see PhotoModePose::Label. -------
+    int PoseIndex = 0;
+    bool bFreezePlayerPose = false; // experimental: lock the player's current frame
+}
+
+
+// -----------------------------------------------------------------------------
+//  Player pose catalog. Index 0 is "None"; the rest resolve to a ready-made
+//  UAnimSequence on the LOCAL player's UPlayerAnimSet at apply time (the assets
+//  aren't reachable until a player pawn exists). These are the game's own idle /
+//  combat-stance / broom-mount poses, so "Combat: Wand" etc. show the real pose
+//  for whatever weapon the player is actually holding.
+// -----------------------------------------------------------------------------
+namespace PhotoModePose
+{
+    // Number of menu entries (index 0 = None).
+    int Count()
+    {
+        return 6;
+    }
+
+    FString Label(int Index)
+    {
+        switch (Index)
+        {
+            case 1: return "Idle (relaxed)";
+            case 2: return "Combat: Wand";
+            case 3: return "Combat: Sword";
+            case 4: return "Combat: Unarmed";
+            case 5: return "Broom mount";
+        }
+        return "None";
+    }
+
+    // Resolve a pose index to its sequence on the player's anim set. Returns null
+    // for "None", or if the anim instance / set / asset isn't available yet.
+    UAnimSequence Resolve(int Index, APlayerCharacter Player)
+    {
+        if (Index <= 0 || Player == nullptr)
+            return nullptr;
+
+        UPlayerAnimInstance Anim = Cast<UPlayerAnimInstance>(Player.CharacterMeshComp.AnimInstance);
+        if (Anim == nullptr || Anim.PlayerAnimSet == nullptr)
+            return nullptr;
+
+        const UPlayerAnimSet Set = Anim.PlayerAnimSet;
+        switch (Index)
+        {
+            case 1: return Set.Base.Idle;
+            case 2: return Set.Base.CombatIdleWand;
+            case 3: return Set.Base.CombatIdleSword;
+            case 4: return Set.Base.CombatIdleNoWeapon;
+            case 5: return Set.Broom.BroomMount;
+        }
+        return nullptr;
+    }
 }
 
 
@@ -434,9 +529,15 @@ class UPhotoModeSubsystem : UScriptWorldSubsystem
     // re-activate a Mover the GAME disabled itself, e.g. significance culling).
     private TArray<AHercCharacter> FrozenChars;
 
-    // Unbound post-process component that drives the screen color filter. Created
-    // lazily the first time a non-neutral filter is used.
+    // Unbound post-process component that drives the screen color filter AND the
+    // background blur. Created lazily the first time either is used.
     private UPostProcessComponent FilterPP;
+
+    // Pose state. AppliedPoseIndex tracks what we last played so we only act on
+    // change; the timer re-asserts a held stance if it has blended out.
+    private int AppliedPoseIndex = 0;
+    private bool bAppliedFreezePlayer = false;
+    private float PoseReassertTimer = 0.0;
 
     UFUNCTION(BlueprintOverride)
     bool ShouldCreateSubsystem(UObject InOuter) const
@@ -478,7 +579,9 @@ class UPhotoModeSubsystem : UScriptWorldSubsystem
         ApplyHUD(Store);
         ApplyClouds(Store, DeltaTime);
         ApplyFilter(Store);
+        ApplyBlur(Store);
         ApplyEntityFreeze(Store, DeltaTime);
+        ApplyPose(Store, DeltaTime);
         ApplyFrozenFly(Store);
 
         // Hold the sky at a fixed hour (server only; SetTimeOfDay no-ops on clients).
@@ -609,6 +712,17 @@ class UPhotoModeSubsystem : UScriptWorldSubsystem
 
     // Hide / restore the HUD only when the desired state changes, so we don't
     // fight other systems that legitimately re-show it.
+    //
+    // Two things live OUTSIDE AHercHUD, so AHercHUD.SetVisibility doesn't touch
+    // them — we clear each the game's own way, via the CVars its systems watch:
+    //   * The aiming reticle (crosshair) is a separate widget owned by
+    //     UPlayerAimingComponent -> Herc.UI.HideCursor.
+    //   * The familiar / monster nameplates (the floating "Quol" name, level,
+    //     stars and health bar) are world-space UWidgetComponents driven by
+    //     UNameplateManagerSubsystem, whose Tick hides every nameplate while
+    //     Herc.UI.HideNameplates is set -> Herc.UI.HideNameplates.
+    // Both are the exact levers the game's own corruption sequence flips, so the
+    // managers restore the widgets cleanly when we turn the toggle back off.
     private void ApplyHUD(UPhotoModeStore Store)
     {
         if (Store.bHideHUD == bAppliedHideHUD)
@@ -617,6 +731,8 @@ class UPhotoModeSubsystem : UScriptWorldSubsystem
         if (HUD == nullptr)
             return;
         HUD.SetVisibility(!Store.bHideHUD);
+        CVar::UI::HideCursor.SetBool(Store.bHideHUD);       // also clear the aiming reticle
+        CVar::UI::HideNameplates.SetBool(Store.bHideHUD);   // and the familiar / monster nameplates
         bAppliedHideHUD = Store.bHideHUD;
     }
 
@@ -654,17 +770,8 @@ class UPhotoModeSubsystem : UScriptWorldSubsystem
         // Don't spawn the component until a filter is actually used.
         if (IsFilterNeutral(Store) && (FilterPP == nullptr || !IsValid(FilterPP)))
             return;
-
-        if (FilterPP == nullptr || !IsValid(FilterPP))
-        {
-            APlayerCharacter Player = Game::GetLocalPlayer();
-            if (Player == nullptr || !IsValid(Player))
-                return;     // e.g. dedicated server / no local pawn yet
-            FilterPP = UPostProcessComponent::Create(Player);
-            if (FilterPP == nullptr)
-                return;
-            FilterPP.bUnbound = true;   // affect the whole screen, free-cam included
-        }
+        if (!EnsurePostProcess())
+            return;
 
         const float Sat = Store.FilterSaturation;
         FilterPP.Settings.bOverride_ColorSaturation = Sat != 1.0;
@@ -680,11 +787,139 @@ class UPhotoModeSubsystem : UScriptWorldSubsystem
         FilterPP.Settings.ColorGain = FVector4(1.0 + 0.25 * T, 1.0, 1.0 - 0.25 * T, 1.0);
     }
 
+    // Background blur via the shared post-process component's cinematic depth of
+    // field: keep a focal plane sharp and blur everything off it. Local & visual
+    // (works on clients), like the color filter. We drive the standard cine-cam
+    // model — focal distance + f-stop (+ a wide sensor so the blur reads) — and
+    // turn the DoF overrides OFF when disabled so the game's own DoF returns.
+    private void ApplyBlur(UPhotoModeStore Store)
+    {
+        // Nothing to do until blur is used (and no component to clear yet).
+        if (!Store.bBlurEnabled && (FilterPP == nullptr || !IsValid(FilterPP)))
+            return;
+        if (!EnsurePostProcess())
+            return;
+
+        FilterPP.Settings.bOverride_DepthOfFieldFocalDistance = Store.bBlurEnabled;
+        FilterPP.Settings.bOverride_DepthOfFieldFstop = Store.bBlurEnabled;
+        FilterPP.Settings.bOverride_DepthOfFieldSensorWidth = Store.bBlurEnabled;
+
+        if (!Store.bBlurEnabled)
+            return;
+
+        const float Strength = Math::Clamp(Store.BlurStrength, 0.0, 1.0);
+        // More strength -> lower f-stop -> shallower depth of field -> more blur.
+        const float FStop = Math::Lerp(PhotoModeConfig::BlurMaxFStop, PhotoModeConfig::BlurMinFStop, Strength);
+
+        FilterPP.Settings.DepthOfFieldFocalDistance = ComputeFocalDistance(Store);
+        FilterPP.Settings.DepthOfFieldFstop = FStop;
+        FilterPP.Settings.DepthOfFieldSensorWidth = PhotoModeConfig::BlurSensorWidth;
+    }
+
+    // Distance (cm) to the focal plane. Auto-focus traces straight out from the
+    // camera and focuses on whatever's at screen center; otherwise (or if the
+    // trace hits nothing) it uses the manual distance.
+    private float ComputeFocalDistance(UPhotoModeStore Store) const
+    {
+        if (!Store.bBlurAutoFocus)
+            return Store.BlurFocalDistance;
+
+        APlayerController PC = Game::GetLocalPlayerController();
+        if (PC == nullptr || PC.PlayerCameraManager == nullptr)
+            return Store.BlurFocalDistance;
+
+        const FVector Start = PC.PlayerCameraManager.CameraLocation;
+        const FVector Dir = PC.PlayerCameraManager.CameraRotation.ForwardVector;
+        const FVector End = Start + Dir * PhotoModeConfig::BlurFocusTraceDistance;
+
+        FHitResult Hit;
+        const bool bHit = System::LineTraceSingle(Start, End, ETraceTypeQuery::TraceTypeQuery1,
+            false, TArray<AActor>(), EDrawDebugTrace::None, Hit, true);
+        if (bHit)
+            return (Hit.ImpactPoint - Start).Size();
+
+        return Store.BlurFocalDistance;   // open sky / nothing hit -> manual fallback
+    }
+
     private bool IsFilterNeutral(UPhotoModeStore Store) const
     {
         return Store.FilterSaturation == 1.0
             && Store.FilterContrast == 1.0
             && Store.FilterTemperature == 0.0;
+    }
+
+    // Lazily create the unbound post-process component on the local player.
+    // Unbound = it covers the whole screen no matter where the free camera flies.
+    // Returns false if there's no local pawn to attach it to yet.
+    private bool EnsurePostProcess()
+    {
+        if (FilterPP != nullptr && IsValid(FilterPP))
+            return true;
+
+        APlayerCharacter Player = Game::GetLocalPlayer();
+        if (Player == nullptr || !IsValid(Player))
+            return false;     // e.g. dedicated server / no local pawn yet
+
+        FilterPP = UPostProcessComponent::Create(Player);
+        if (FilterPP == nullptr)
+            return false;
+        FilterPP.bUnbound = true;
+        return true;
+    }
+
+    // Player pose: play one of the game's idle / combat-stance / broom-mount
+    // sequences on the local player as a full-body slot animation, and (when the
+    // experimental lock is on) freeze the player's own time so the current frame
+    // holds rock-still — which also captures any in-game action (an attack swing,
+    // a cast) the instant you tick it. Server only: the host owns the pawn and
+    // the held pose replicates from there.
+    private void ApplyPose(UPhotoModeStore Store, float DeltaTime)
+    {
+        if (!System::IsServer())
+            return;
+
+        APlayerCharacter Player = Game::GetLocalPlayer();
+        if (Player == nullptr || !IsValid(Player))
+            return;
+
+        // --- Stance (full-body slot animation) ---
+        if (Store.PoseIndex != AppliedPoseIndex)
+        {
+            AppliedPoseIndex = Store.PoseIndex;
+            PoseReassertTimer = 0.0;
+            if (Store.PoseIndex <= 0)
+                Player.StopSlotAnimation(0.2, ECharacterAnimationSlot::FullBody);
+            else
+                PlayPose(Player, Store.PoseIndex);
+        }
+        else if (Store.PoseIndex > 0 && !Store.bFreezePlayerPose)
+        {
+            // Re-assert a held stance, but only once it has actually blended out,
+            // so a still-playing pose is never restarted (no visible pop).
+            PoseReassertTimer += DeltaTime;
+            if (PoseReassertTimer >= PhotoModeConfig::PoseReassertInterval)
+            {
+                PoseReassertTimer = 0.0;
+                UAnimInstance Anim = Player.CharacterMeshComp.AnimInstance;
+                if (Anim != nullptr && !Anim.IsSlotActive(n"DefaultSlot"))
+                    PlayPose(Player, Store.PoseIndex);
+            }
+        }
+
+        // --- Freeze player pose (experimental): per-actor time dilation, exactly
+        //     like the AI freeze, but applied to the player so YOU hold still. ---
+        if (Store.bFreezePlayerPose != bAppliedFreezePlayer)
+        {
+            bAppliedFreezePlayer = Store.bFreezePlayerPose;
+            Player.CustomTimeDilation = Store.bFreezePlayerPose ? 0.0 : 1.0;
+        }
+    }
+
+    private void PlayPose(APlayerCharacter Player, int Index)
+    {
+        UAnimSequence Seq = PhotoModePose::Resolve(Index, Player);
+        if (Seq != nullptr)
+            Player.PlaySlotAnimation(Seq, 0.2, 0.2, ECharacterAnimationSlot::FullBody);
     }
 }
 
@@ -724,11 +959,15 @@ class UPhotoModeDebugWindow : UImGuiDebugMenuWindow
 
         DrawFreeze(Store, bServer);
         ImGui::NewLine();
+        DrawPose(Store, bServer);
+        ImGui::NewLine();
         DrawTimeOfDay(Store, bServer);
         ImGui::NewLine();
         DrawSky(Store);
         ImGui::NewLine();
         DrawFilter(Store);
+        ImGui::NewLine();
+        DrawBlur(Store);
         ImGui::NewLine();
         DrawHud(Store);
         ImGui::Separator();
@@ -741,6 +980,9 @@ class UPhotoModeDebugWindow : UImGuiDebugMenuWindow
             Store.bHoldTime = false;
             Store.bHideClouds = false;
             Store.bHideHUD = false;
+            Store.bBlurEnabled = false;
+            Store.PoseIndex = 0;            // subsystem stops the slot anim next tick
+            Store.bFreezePlayerPose = false; // subsystem restores player time next tick
             SetFilter(Store, 1.0, 1.0, 0.0);   // neutral = no filter
         }
         ImGui::TextDisabled("Tip: use your free-camera key to fly the shot.");
@@ -783,6 +1025,38 @@ class UPhotoModeDebugWindow : UImGuiDebugMenuWindow
             if (ImGui::DragFloat("Camera speed", Speed, 25.0, 25.0, 50000.0))
                 Store.CameraSpeed = Math::Clamp(Speed, 1.0, 100000.0);
         }
+    }
+
+    // --- Player pose ---------------------------------------------------------
+    // Pick a stance for the player (the game's own idle / combat / broom poses),
+    // or freeze the player's frame to capture any in-game action (an attack, a
+    // cast). Plays on the authoritative pawn, so it's host only.
+    private void DrawPose(UPhotoModeStore Store, bool bServer)
+    {
+        ImGui::Text("Player pose");
+        ImGui::Separator();
+
+        if (!bServer)
+        {
+            ImGui::TextDisabled("(host only)");
+            return;
+        }
+
+        for (int i = 0; i < PhotoModePose::Count(); i++)
+        {
+            bool bSel = (i == Store.PoseIndex);
+            if (ImGui::Selectable(f"{PhotoModePose::Label(i)}##pose{i}", bSel))
+                Store.PoseIndex = i;
+        }
+        ImGui::TextDisabled("Stand still to hold a stance. Wand/Sword use your real weapon's pose.");
+
+        // Experimental hard-lock: freezes the player exactly like the AI freeze.
+        // Trigger an attack / cast in normal play, then tick this to hold that frame.
+        bool bFreeze = Store.bFreezePlayerPose;
+        if (ImGui::Checkbox("Freeze player pose (experimental)", bFreeze))
+            Store.bFreezePlayerPose = bFreeze;
+        ImGui::SameLine();
+        ImGui::TextDisabled("locks your current frame");
     }
 
     // --- Time of day ---------------------------------------------------------
@@ -907,11 +1181,50 @@ class UPhotoModeDebugWindow : UImGuiDebugMenuWindow
         Store.FilterTemperature = Temp;
     }
 
+    // --- Background blur (depth of field) ------------------------------------
+    // Local visual, like the filter (no host gate). Blurs everything off the
+    // focal plane; auto-focus locks onto whatever's at the center of the shot.
+    private void DrawBlur(UPhotoModeStore Store)
+    {
+        ImGui::Text("Background blur");
+        ImGui::Separator();
+
+        bool bBlur = Store.bBlurEnabled;
+        if (ImGui::Checkbox("Enable blur (depth of field)", bBlur))
+            Store.bBlurEnabled = bBlur;
+
+        if (!Store.bBlurEnabled)
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("keeps your subject sharp, blurs the rest");
+            return;
+        }
+
+        float Strength = Store.BlurStrength;
+        if (ImGui::DragFloat("Strength", Strength, 0.01, 0.0, 1.0))
+            Store.BlurStrength = Math::Clamp(Strength, 0.0, 1.0);
+
+        bool bAuto = Store.bBlurAutoFocus;
+        if (ImGui::Checkbox("Auto focus", bAuto))
+            Store.bBlurAutoFocus = bAuto;
+        ImGui::SameLine();
+        ImGui::TextDisabled("focus on screen center");
+
+        if (!Store.bBlurAutoFocus)
+        {
+            float Dist = Store.BlurFocalDistance;
+            if (ImGui::DragFloat("Focus distance (cm)", Dist, 10.0, 10.0, 100000.0))
+                Store.BlurFocalDistance = Math::Clamp(Dist, 1.0, 1000000.0);
+        }
+    }
+
     // --- HUD -----------------------------------------------------------------
     private void DrawHud(UPhotoModeStore Store)
     {
         bool bHideHUD = Store.bHideHUD;
         if (ImGui::Checkbox("Hide HUD", bHideHUD))
             Store.bHideHUD = bHideHUD;
+        ImGui::SameLine();
+        ImGui::TextDisabled("hides the HUD, the aiming crosshair and familiar / monster nameplates");
     }
 }

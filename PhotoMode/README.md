@@ -19,7 +19,17 @@ juggling the hide-HUD key and free-cam by hand, you get a single panel that can:
   grayscale), **contrast** and a **warm/cool** tint, with one-tap presets
   (**Vivid / B&W / Noir / Sepia / Warm / Cool**). Local & visual, so it works in
   multiplayer too and applies wherever the free camera flies.
-- **Hide the HUD** — toggle the whole interface off (and back on).
+- **Blur the background** — depth-of-field that keeps your subject sharp and blurs
+  everything off the focal plane. A **Strength** slider sets how shallow the focus
+  is, and **Auto focus** locks onto whatever's at the centre of your shot (or set
+  the focus distance by hand). Local & visual, like the filter.
+- **Pose the player** — drop into one of the game's own stances (**Idle**,
+  **Combat: Wand / Sword / Unarmed**, **Broom mount**), shown with whatever weapon
+  you're actually holding. Or flip **Freeze player pose** to hard-lock your current
+  frame — trigger an attack or a cast in normal play, then freeze it mid-action.
+- **Hide the HUD** — toggle the whole interface off (and back on), including the
+  aiming crosshair and the floating familiar / monster nameplates (name, level,
+  stars and health bar).
 
 > **About "weather":** Witchspire has no rain/storm/weather state machine exposed
 > to mods — the sky is a UE5 Day Sequence + Sky System. So the real atmosphere
@@ -52,12 +62,17 @@ two openers will toggle each other and cancel out.
 | **Saturation** | Color intensity. **0 = grayscale**, 1 = normal, >1 = vivid. |
 | **Contrast** | Tonal contrast (1 = normal). |
 | **Temperature** | Warm ↔ cool tint (0 = neutral). |
-| **Hide HUD** | Turns the whole HUD off. |
-| **Reset everything** | Unfreeze, show HUD, show clouds, release the time hold, clear the filter. |
+| **Enable blur (depth of field)** | Turns background blur on. Off = the game's own DoF is untouched. |
+| **Strength** | How shallow the focus is — higher blurs the off-focus background more (maps to a lower camera f-stop). |
+| **Auto focus** | Focuses on whatever's at the centre of the shot. Turn off to set **Focus distance (cm)** by hand. |
+| **Pose** | Pick a stance (**None / Idle / Combat: Wand / Sword / Unarmed / Broom mount**). Stand still to hold it. |
+| **Freeze player pose** | Hard-locks your current frame (experimental) — trigger an attack/cast, then tick this to hold that exact pose. |
+| **Hide HUD** | Turns the whole HUD off, plus the aiming crosshair and the familiar / monster nameplates. |
+| **Reset everything** | Unfreeze, show HUD, show clouds, release the time hold, clear the filter and blur, drop the pose. |
 
-The HUD and cloud toggles are **local** (visual only). Freeze and time of day are
-**server-authoritative**, so they apply on the host — single-player or
-listen-server.
+The HUD, cloud, filter and blur toggles are **local** (visual only). Freeze, time
+of day and the player pose are **server-authoritative**, so they apply on the
+host — single-player or listen-server.
 
 ## Flying the free camera while frozen
 
@@ -119,7 +134,27 @@ Everything is driven through the game's own systems — the same ones the native
   covers the whole screen no matter where the free camera flies, and each grade
   only overrides when its slider is off-neutral, so a neutral filter leaves the
   game's own color grading untouched.
-- **HUD** — `AHercHUD::SetVisibility()`.
+- **Background blur** — the **same unbound `UPostProcessComponent`** as the filter,
+  driving `FPostProcessSettings`' cinematic depth of field: `DepthOfFieldFocalDistance`
+  (the focal plane), `DepthOfFieldFstop` (Strength maps a wider f-stop → shallower
+  focus → more blur) and a wide `DepthOfFieldSensorWidth` so the blur reads on
+  screen. **Auto focus** line-traces straight out from the camera and focuses on the
+  first thing it hits (falling back to the manual distance over open sky). The DoF
+  overrides are switched **off** when blur is disabled, so the game's own DoF returns.
+- **Player pose** — the game's own pose sequences, played on the local player as a
+  full-body slot animation via `AHercCharacter::PlaySlotAnimation()`. The sequences
+  come straight from the player's `UPlayerAnimSet` (`Base.Idle`,
+  `Base.CombatIdleWand` / `CombatIdleSword` / `CombatIdleNoWeapon`, `Broom.BroomMount`),
+  so a stance shows the real pose for your equipped weapon. A held stance is
+  re-asserted only once it has actually blended out (checked with `IsSlotActive`),
+  so it never visibly restarts. **Freeze player pose** sets the player's own
+  `CustomTimeDilation = 0` — the same per-actor freeze used for AI, but pointed at
+  you — which holds whatever frame you're on, including a mid-swing attack or a cast.
+- **HUD** — `AHercHUD::SetVisibility()`, plus the two widgets that live outside it:
+  the aiming crosshair (`Herc.UI.HideCursor`) and the familiar / monster nameplates
+  (`Herc.UI.HideNameplates`, which `UNameplateManagerSubsystem` watches to hide them
+  all). These are the same CVars the game's own corruption sequence flips, so the
+  widgets come back cleanly when Hide HUD is turned off.
 
 A `UScriptWorldSubsystem` enforces the toggles every frame (so they hold with the
 panel closed), and shared state lives on a `UScriptGameInstanceSubsystem`
